@@ -205,7 +205,7 @@ resource "aws_security_group" "capstone_sg_backend" {
 }
  # create a wordpress webserver
 resource "aws_instance" "wordpress_server" {
-  ami                    = "ami-0a91cd140a1fc148a" # Amazon Linux 2
+  ami                    = "ami-099400d52583dd8c4" # Amazon Linux 2
   instance_type          = "t2.micro"
   subnet_id              = aws_subnet.public_subnet[0].id
   vpc_security_group_ids = [aws_security_group.capstone_sg_frontend.id]
@@ -256,4 +256,144 @@ resource "aws_instance" "wordpress_server" {
   tags = {
     Name = "${local.name}-wordpress-server"
   }
+}
+
+#creating database subnet group
+resource "aws_db_subnet_group" "wordpress_db_subnet_group" {
+  name       = "${local.name}-db-subnet-group"
+  subnet_ids = aws_subnet.private_subnet[*].id
+
+  tags = {
+    Name = "${local.name}-db-subnet-group"
+  }
+}
+
+# Creating Mysql wordpress database instance
+resource "aws_db_instance" "wordpress_db" {
+  identifier = "${local.name}-wordpress-db"
+
+  allocated_storage = 20
+  engine            = "mysql"
+  engine_version    = "8.0"
+  instance_class    = "db.t3.micro"
+
+  db_name  = var.db_name
+  username = var.db_username
+  password = var.db_password
+
+  db_subnet_group_name   = aws_db_subnet_group.wordpress_db_subnet_group.name
+  vpc_security_group_ids = [aws_security_group.capstone_sg_backend.id]
+
+  skip_final_snapshot = true
+
+  tags = {
+    Name = "${local.name}-wordpress-db"
+  }
+}
+
+
+# creating IAM role
+resource "aws_iam_role" "ec2_role" {
+  name = "${local.name}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# creating media_bucket IAM policy
+resource "aws_iam_policy" "s3_policy" {
+  name = "${local.name}-s3-policy"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:*"]   # ⚠️ Should be restricted in production
+      Resource = "*"
+    }]
+  })
+}
+
+
+# Attaching IAM_role_policy to s3 media_bucket policy
+resource "aws_iam_role_policy_attachment" "attach_s3_policy" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = aws_iam_policy.s3_policy.arn
+}
+# creating instance profile
+resource "aws_iam_instance_profile" "ec2_instance_profile" {
+  name = "${local.name}-instance-profile"
+  role = aws_iam_role.ec2_role.name
+}
+# Create s3 media bucket
+resource "aws_s3_bucket" "media_bucket" {
+  bucket        = "media-s3-bucket-eu2"
+  force_destroy = true
+
+  tags = {
+    Name = "${local.name}-media-bucket"
+  }
+}
+# creating log bucket
+resource "aws_s3_bucket" "log_bucket" {
+  bucket        = "log-s3-bucket-eu2"
+  force_destroy = true
+
+  tags = {
+    Name = "${local.name}-log-bucket"
+  }
+}
+# cfreating code bucket
+resource "aws_s3_bucket" "code_bucket" {
+  bucket        = "code-s3-bucket-eu2"
+  force_destroy = true
+
+  tags = {
+    Name = "${local.name}-code-bucket"
+  }
+}
+
+# Media bucket access
+resource "aws_s3_bucket_public_access_block" "media_access" {
+  bucket = aws_s3_bucket.media_bucket.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+# Log bucket access
+resource "aws_s3_bucket_public_access_block" "log_access" {
+  bucket = aws_s3_bucket.log_bucket.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+} 
+
+#log bucket ownership & acl
+resource "aws_s3_bucket_ownership_controls" "log_ownership" {
+  bucket = aws_s3_bucket.log_bucket.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_s3_bucket_acl" "log_acl" {
+  depends_on = [aws_s3_bucket_ownership_controls.log_ownership]
+
+  bucket = aws_s3_bucket.log_bucket.id
+  acl    = "private"
 }
