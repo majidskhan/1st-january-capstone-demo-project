@@ -1,7 +1,34 @@
 
 locals {
   name = "capstone"
+  db_cred = jsondecode(
+    aws_secretsmanager_secret_version.db_cred_version.secret_string
+  )
 }
+# Run Checkov scan for the project
+resource "null_resource" "checkov_scan" {
+  provisioner "local-exec" {
+    command     = "./checkov_scan.sh"
+    interpreter = ["bash", "-c"]
+  }
+
+  # Cleanup the Checkov output file when resource is destroyed
+  provisioner "local-exec" {
+    when    = destroy
+    command = "rm -f checkov_output.json"
+  }
+
+  # Always run the scan on every terraform apply
+  triggers = {
+    always_run = timestamp()
+  }
+}
+
+# Output to indicate scan status
+output "checkov_scan_status" {
+  value = "Checkov scan completed. Check the checkov_output.json file for details."
+}
+
 
 # create a vpc
 resource "aws_vpc" "vpc" {
@@ -14,27 +41,6 @@ resource "aws_vpc" "vpc" {
   }
 }
 
-# Get Availability Zones
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-# create an ssh key pair
-resource "tls_private_key" "keypair" {
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}
-
-resource "aws_key_pair" "public_key" {
-  key_name   = "${local.name}-keypair"
-  public_key = tls_private_key.keypair.public_key_openssh
-}
-
-resource "local_file" "private_key" {
-  content  = tls_private_key.keypair.private_key_pem
-  filename = "${local.name}-keypair.pem"
-  file_permission = "0400"
-}
 # create public subnets
 resource "aws_subnet" "public_subnet" {
   count                   = 2
@@ -129,7 +135,7 @@ resource "aws_route_table_association" "private_assoc" {
   route_table_id = aws_route_table.private.id
 }
 
-# Frontend Security Group (ALB / Web Servers)
+# Frontend ec2 Security Group for Web Servers
 resource "aws_security_group" "capstone_sg_frontend" {
   name        = "capstone-sg-frontend"
   description = "Frontend security group for ALB and Apache web servers"
@@ -175,7 +181,7 @@ resource "aws_security_group" "capstone_sg_frontend" {
   }
 }
 
-# Backend Security Group (Database Tier)
+# Backend Security Group for Database RDS
 resource "aws_security_group" "capstone_sg_backend" {
   name        = "capstone-sg-backend"
   description = "Backend security group for database access"
@@ -189,72 +195,160 @@ resource "aws_security_group" "capstone_sg_backend" {
     protocol        = "tcp"
     security_groups = [aws_security_group.capstone_sg_frontend.id]
 }
-
-
-  # Allow all outbound traffic
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
   tags = {
     Name = "${local.name}-sg-backend"
   }
 }
- # create a wordpress webserver
+
+# create an ssh key pair
+resource "tls_private_key" "keypair" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "public_key" {
+  key_name   = "${local.name}-keypair"
+  public_key = tls_private_key.keypair.public_key_openssh
+}
+
+resource "local_file" "private_key" {
+  content  = tls_private_key.keypair.private_key_pem
+  filename = "${local.name}-keypair.pem"
+  file_permission = "0400"
+}
+
+# IAM Role for WordPress EC2 Instances
+resource "aws_iam_role" "eu2acp_wordpress_ec2_role" {
+  name = "${local.name}-wordpress-ec2-role"
+
+  description = "IAM role for EC2 instances toaccess AWS services S3, Secrets Manager, CloudWatch"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name    = "${local.name}-wordpress-ec2-role"
+    Purpose = "WordPressEC2Access"
+  }
+}
+
+ # create ec2 wordpress webserver
 resource "aws_instance" "wordpress_server" {
   ami                    = "ami-099400d52583dd8c4" # Amazon Linux 2
   instance_type          = "t2.micro"
   subnet_id              = aws_subnet.public_subnet[0].id
-  vpc_security_group_ids = [aws_security_group.capstone_sg_frontend.id]
+  vpc_security_group_ids = [aws_security_group.capstone_sg_frontend.id, aws_security_group.capstone_sg_backend.id ]
   key_name               = aws_key_pair.public_key.key_name
 
-  user_data = <<-EOF
-    #!/bin/bash
-    set -e
-
-    # Update system
-    yum update -y
-
-    # Install Apache, PHP, MySQL client
-    amazon-linux-extras enable php8.0
-    yum clean metadata
-    yum install -y httpd php php-mysqlnd wget unzip
-
-    # Start and enable Apache
-    systemctl start httpd
-    systemctl enable httpd
-
-    # Download and install WordPress
-    cd /var/www/html
-    wget https://wordpress.org/latest.tar.gz
-    tar -xzf latest.tar.gz
-    cp -r wordpress/* /var/www/html/
-    rm -rf wordpress latest.tar.gz
-
-    # Set permissions
-    chown -R apache:apache /var/www/html
-    chmod -R 755 /var/www/html
-
-    # Configure WordPress
-    cp wp-config-sample.php wp-config.php
-
-    sed -i "s/database_name_here/${var.db_name}/" wp-config.php
-    sed -i "s/username_here/${var.db_username}/" wp-config.php
-    sed -i "s/password_here/${var.db_password}/" wp-config.php
-    sed -i "s/localhost/${replace(aws_db_instance.wordpress_db.endpoint, ":3306", "")}/" wp-config.php
-
-    # Restart Apache
-    systemctl restart httpd
-
-    # Set hostname
-    hostnamectl set-hostname ${local.name}-wordpress
-  EOF
+  iam_instance_profile = aws_iam_instance_profile.iam_instance_profile.name
+ 
+  user_data = filebase64("wp_userdata.tf")   
 
   tags = {
     Name = "${local.name}-wordpress-server"
+  }
+}   
+
+
+# AMI Creation from WordPress Webserver
+resource "aws_ami_from_instance" "wordpress_ami" {
+  name                    = "${local.name}-wordpress-ami"
+  source_instance_id      = aws_instance.wordpress_server.id
+  snapshot_without_reboot = true
+
+  depends_on = [
+    aws_instance.wordpress_server,
+    time_sleep.wordpress_ami_wait
+  ]
+
+  tags = {
+    Name    = "${local.name}-wordpress-ami"
+    Project = local.name
+  }
+}
+
+# Wait for Userdata Completion
+resource "time_sleep" "wordpress_ami_wait" {
+  depends_on      = [aws_instance.wordpress_server]
+  create_duration = "300s"
+}
+
+# policy with least privilege for S3, CloudWatch Logs, and Secrets Manager access
+resource "aws_iam_policy" "capstone_wordpress_ec2_policy" {
+  name        = "${local.name}-wordpress-ec2-policy"
+  description = "Least-privilege policy for WordPress EC2 access to S3, CloudWatch Logs, and Secrets Manager."
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket"
+        ],
+        Resource = [
+          aws_s3_bucket.code_bucket.arn,
+          "${aws_s3_bucket.code_bucket.arn}/*",
+          aws_s3_bucket.media_bucket.arn,
+          "${aws_s3_bucket.media_bucket.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        Resource = "*"
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ],
+        Resource = aws_secretsmanager_secret.db_credentials.arn
+      }
+    ]
+  })
+
+  tags = {
+    Name    = "${local.name}-wordpress-ec2-policy"
+    Project = local.name
+  }
+}
+
+# Attach the policy to the IAM role
+resource "aws_iam_role_policy_attachment" "capstone_wordpress_policy_attach" {
+  role       = aws_iam_role.capstone_wordpress_ec2_role.name
+  policy_arn = aws_iam_policy.capstone_wordpress_ec2_policy.arn
+}
+
+# Instance profile to associate IAM role with EC2 instances
+resource "aws_iam_instance_profile" "capstone_wordpress_instance_profile" {
+  name = "${local.name}-wordpress-instance-profile"
+  role = aws_iam_role.capstone_wordpress_ec2_role.name
+
+  tags = {
+    Name    = "${local.name}-wordpress-instance-profile"
+    Project = local.name
   }
 }
 
@@ -268,132 +362,286 @@ resource "aws_db_subnet_group" "wordpress_db_subnet_group" {
   }
 }
 
-# Creating Mysql wordpress database instance
+# Create RDS MySQL Instance for WordPress
 resource "aws_db_instance" "wordpress_db" {
-  identifier = "${local.name}-wordpress-db"
+  identifier             = "${local.name}-wordpress-db"
 
-  allocated_storage = 20
-  engine            = "mysql"
-  engine_version    = "8.0"
-  instance_class    = "db.t3.micro"
+  allocated_storage      = 20
+  max_allocated_storage  = 100
+  storage_type           = "gp2"
 
-  db_name  = var.db_name
-  username = var.db_username
-  password = var.db_password
+  engine                 = "mysql"
+  engine_version         = "8.0"
+  instance_class         = "db.t3.micro"
 
-  db_subnet_group_name   = aws_db_subnet_group.wordpress_db_subnet_group.name
+  db_name                = var.db_name
+  username               = local.db_cred.username
+  password               = local.db_cred.password
+
+  parameter_group_name   = "default.mysql8.0"
+  db_subnet_group_name   = aws_db_subnet_group.capstone_db_subnet_group.name
   vpc_security_group_ids = [aws_security_group.capstone_sg_backend.id]
 
-  skip_final_snapshot = true
+  publicly_accessible    = false
+  multi_az               = false
+
+  backup_retention_period = 3
+  backup_window           = "03:00-04:00"
+
+  skip_final_snapshot    = true
+  deletion_protection    = false
 
   tags = {
-    Name = "${local.name}-wordpress-db"
+    Name    = "${local.name}-wordpress-db"
+    Project = local.name
   }
 }
 
+# Application Load Balancer
+resource "aws_lb" "wordpress_alb" {
+  name               = "${local.name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.capstone_sg_frontend.id]
+  subnets            = aws_subnet.public_subnet[*].id
 
-# creating IAM role
-resource "aws_iam_role" "ec2_role" {
-  name = "${local.name}-ec2-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-# creating media_bucket IAM policy
-resource "aws_iam_policy" "s3_policy" {
-  name = "${local.name}-s3-policy"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:*"]   # ⚠️ Should be restricted in production
-      Resource = "*"
-    }]
-  })
-}
-
-
-# Attaching IAM_role_policy to s3 media_bucket policy
-resource "aws_iam_role_policy_attachment" "attach_s3_policy" {
-  role       = aws_iam_role.ec2_role.name
-  policy_arn = aws_iam_policy.s3_policy.arn
-}
-# creating instance profile
-resource "aws_iam_instance_profile" "ec2_instance_profile" {
-  name = "${local.name}-instance-profile"
-  role = aws_iam_role.ec2_role.name
-}
-# Create s3 media bucket
-resource "aws_s3_bucket" "media_bucket" {
-  bucket        = "media-s3-bucket-eu2"
-  force_destroy = true
+  enable_deletion_protection = false
 
   tags = {
-    Name = "${local.name}-media-bucket"
-  }
-}
-# creating log bucket
-resource "aws_s3_bucket" "log_bucket" {
-  bucket        = "log-s3-bucket-eu2"
-  force_destroy = true
-
-  tags = {
-    Name = "${local.name}-log-bucket"
-  }
-}
-# cfreating code bucket
-resource "aws_s3_bucket" "code_bucket" {
-  bucket        = "code-s3-bucket-eu2"
-  force_destroy = true
-
-  tags = {
-    Name = "${local.name}-code-bucket"
+    Name = "${local.name}-alb"
   }
 }
 
-# Media bucket access
-resource "aws_s3_bucket_public_access_block" "media_access" {
-  bucket = aws_s3_bucket.media_bucket.id
+# HTTP Target Group
+resource "aws_lb_target_group" "wordpress_http_tg" {
+  name     = "${local.name}-http-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.vpc.id
 
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+  health_check {
+    path                = "/indextest.html"
+    protocol            = "HTTP"
+    port                = "traffic-port"
+    interval            = 60
+    timeout             = 30
+    healthy_threshold   = 3
+    unhealthy_threshold = 5
+  }
+
+  tags = {
+    Name = "${local.name}-http-target-group"
+  }
 }
-# Log bucket access
-resource "aws_s3_bucket_public_access_block" "log_access" {
-  bucket = aws_s3_bucket.log_bucket.id
 
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+# HTTPS Target Group
+resource "aws_lb_target_group" "wordpress_https_tg" {
+  name     = "${local.name}-https-tg"
+  port     = 443
+  protocol = "HTTPS"
+  vpc_id   = aws_vpc.vpc.id
+
+  health_check {
+    path                = "/indextest.html"
+    protocol            = "HTTPS"
+    port                = "traffic-port"
+    interval            = 60
+    timeout             = 30
+    healthy_threshold   = 3
+    unhealthy_threshold = 5
+  }
+
+  tags = {
+    Name = "${local.name}-https-target-group"
+  }
+}
+
+# Target Group Attachment for HTTP
+resource "aws_lb_target_group_attachment" "http_attachment" {
+  target_group_arn = aws_lb_target_group.wordpress_http_tg.arn
+  target_id        = aws_instance.wordpress_server.id
+  port             = 80
+}
+
+# Target Group Attachment for HTTPS
+resource "aws_lb_target_group_attachment" "https_attachment" {
+  target_group_arn = aws_lb_target_group.wordpress_https_tg.arn
+  target_id        = aws_instance.wordpress_server.id
+  port             = 443
+}
+
+# launch template for autoscaling group
+resource "aws_launch_template" "wordpress_launch_template" {
+  name_prefix   = "${local.name}-launch-template-"
+  image_id      = aws_ami_from_instance.wordpress_ami.id
+  instance_type = "t2.micro"
+  key_name      = aws_key_pair.public_key.key_name
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.capstone_wordpress_instance_profile.name
+  }
+
+  network_interfaces {
+    security_groups = [aws_security_group.capstone_sg_frontend.id, aws_security_group.capstone_sg_backend.id ]
+    associate_public_ip_address = true
+  }
+
+  user_data = filebase64("wp_userdata.tf")   
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "${local.name}-autoscaling-instance"
+    }
+  }
 } 
 
-#log bucket ownership & acl
-resource "aws_s3_bucket_ownership_controls" "log_ownership" {
-  bucket = aws_s3_bucket.log_bucket.id
+# Autoscaling policy
+resource "aws_autoscaling_policy" "scale_out" {
+  name                   = "scale-out-policy"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.wordpress_asg.name
+}
 
-  rule {
-    object_ownership = "BucketOwnerPreferred"
+# auto scaling group
+resource "aws_autoscaling_group" "wordpress_asg" {
+  name                      = "${local.name}-asg"
+  desired_capacity          = 2
+  max_size                  = 5
+  min_size                  = 1
+  health_check_grace_period = 300
+  health_check_type         = "EC2"
+  force_delete              = true
+
+  launch_template {
+    id      = aws_launch_template.wordpress_launch_template.id
+    version = "$Latest"
+  }
+
+  vpc_zone_identifier = aws_subnet.public_subnet[*].id
+
+  target_group_arns = [
+    aws_lb_target_group.wordpress_http_tg.arn,
+    aws_lb_target_group.wordpress_https_tg.arn
+  ]
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-asg"
+    propagate_at_launch = true
   }
 }
 
-resource "aws_s3_bucket_acl" "log_acl" {
-  depends_on = [aws_s3_bucket_ownership_controls.log_ownership]
+# HTTP Listener
+resource "aws_lb_listener" "wordpress_http_listener" {
+  load_balancer_arn = aws_lb.wordpress_alb.arn
+  port              = 80
+  protocol          = "HTTP"
 
-  bucket = aws_s3_bucket.log_bucket.id
-  acl    = "private"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.wordpress_http_tg.arn
+  }
+}
+
+# Import the hosted zone 
+data "aws_route53_zone" "majiktech_zone" {
+  name         = "majiktech.uk"
+  private_zone = false
+}
+
+# Create ACM certificate for ssl
+resource "aws_acm_certificate" "wordpress_acm" {
+  domain_name       = "majiktech.uk"
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Route53 validation record for ACM certificate
+resource "aws_route53_record" "acm_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.wordpress_acm.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = data.aws_route53_zone.majiktech_zone.zone_id
+}
+
+# Validate ACM certificate
+resource "aws_acm_certificate_validation" "wordpress_acm_validation" {
+  certificate_arn         = aws_acm_certificate.wordpress_acm.arn
+  validation_record_fqdns = [for record in aws_route53_record.acm_validation : record.fqdn]
+}
+
+# HTTPS Listener for the WordPress ALB
+resource "aws_lb_listener" "wordpress_https_listener" {
+  load_balancer_arn = aws_lb.wordpress_alb.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = aws_acm_certificate.wordpress_acm.arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.wordpress_https_tg.arn
+  }
+}
+
+# Route53 validation records for ACM certificate
+resource "aws_route53_record" "wordpress_acm_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.wordpress_acm_cert.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = data.aws_route53_zone.majiktech_uk.zone_id
+}
+
+# Validate ACM certificate using Route53 DNS records
+resource "aws_acm_certificate_validation" "wordpress_cert_validation" {
+  certificate_arn         = aws_acm_certificate.wordpress_acm_cert.arn
+  validation_record_fqdns = [for record in aws_route53_record.wordpress_acm_validation : record.fqdn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "high_cpu" {
+  alarm_name          = "high-cpu-utilization"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120
+  statistic           = "Average"
+  threshold           = 70
+
+  alarm_description   = "Triggers when CPU exceeds 70% utilization"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.set27-auto-scaling-group.name
+  }
+
+  alarm_actions = [
+    aws_autoscaling_policy.scale_out.arn,
+    aws_sns_topic.server_alert.arn
+  ]
 }
