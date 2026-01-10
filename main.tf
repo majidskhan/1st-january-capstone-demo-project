@@ -1,10 +1,10 @@
 
+# Local variable to decode secret for RDS and EC2 usage
 locals {
-  name = "capstone"
-  db_cred = jsondecode(
-    aws_secretsmanager_secret_version.db_cred_version.secret_string
-  )
+  name    = "capstone"
+  db_cred = jsondecode(aws_secretsmanager_secret_version.capstone_db_cred_version.secret_string)
 }
+
 # Run Checkov scan for the project
 resource "null_resource" "checkov_scan" {
   provisioner "local-exec" {
@@ -41,12 +41,16 @@ resource "aws_vpc" "vpc" {
   }
 }
 
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
 # create public subnets
 resource "aws_subnet" "public_subnet" {
   count                   = 2
   vpc_id                  = aws_vpc.vpc.id
   cidr_block              = "10.0.${count.index}.0/24"
-  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  availability_zone       = element (data.aws_availability_zones.available.names, count.index)
   map_public_ip_on_launch = true
 
   tags = {
@@ -58,8 +62,8 @@ resource "aws_subnet" "public_subnet" {
 resource "aws_subnet" "private_subnet" {
   count             = 2
   vpc_id            = aws_vpc.vpc.id
-  cidr_block        = "10.0.${count.index + 10}.0/24"
-  availability_zone = data.aws_availability_zones.available.names[count.index]
+  cidr_block        = "10.0.${count.index + 3}.0/24"
+  availability_zone = element(data.aws_availability_zones.available.names, count.index)
 
   tags = {
     Name = "${local.name}-private-subnet-${count.index + 1}"
@@ -256,9 +260,9 @@ resource "aws_instance" "wordpress_server" {
   vpc_security_group_ids = [aws_security_group.capstone_sg_frontend.id, aws_security_group.capstone_sg_backend.id ]
   key_name               = aws_key_pair.public_key.key_name
 
-  iam_instance_profile = aws_iam_instance_profile.iam_instance_profile.name
+  iam_instance_profile = aws_iam_instance_profile.instance_profile.name
  
-  user_data = filebase64("wp_userdata.tf")   
+  user_data = file("wp_userdata.tf")   
 
   tags = {
     Name = "${local.name}-wordpress-server"
@@ -324,7 +328,7 @@ resource "aws_iam_policy" "capstone_wordpress_ec2_policy" {
         Action = [
           "secretsmanager:GetSecretValue"
         ],
-        Resource = aws_secretsmanager_secret.db_credentials.arn
+        Resource = aws_secretsmanager_secret.capstone_db_cred.arn
       }
     ]
   })
@@ -337,19 +341,30 @@ resource "aws_iam_policy" "capstone_wordpress_ec2_policy" {
 
 # Attach the policy to the IAM role
 resource "aws_iam_role_policy_attachment" "capstone_wordpress_policy_attach" {
-  role       = aws_iam_role.capstone_wordpress_ec2_role.name
+  role       = aws_iam_role.iam_role.name
   policy_arn = aws_iam_policy.capstone_wordpress_ec2_policy.arn
 }
 
 # Instance profile to associate IAM role with EC2 instances
 resource "aws_iam_instance_profile" "capstone_wordpress_instance_profile" {
   name = "${local.name}-wordpress-instance-profile"
-  role = aws_iam_role.capstone_wordpress_ec2_role.name
+  role = aws_iam_role.eu2acp_wordpress_ec2_role.name
 
   tags = {
     Name    = "${local.name}-wordpress-instance-profile"
     Project = local.name
   }
+}
+
+# Secrets Manager for database credentials
+resource "aws_secretsmanager_secret" "capstone_db_cred" {
+  name        = "capstone-db-cred"
+  description = "Database credentials for the WordPress image-sharing application"
+}
+
+resource "aws_secretsmanager_secret_version" "capstone_db_cred_version" {
+  secret_id     = aws_secretsmanager_secret.capstone_db_cred.id
+  secret_string = jsonencode(var.dbcred1)
 }
 
 #creating database subnet group
@@ -379,7 +394,7 @@ resource "aws_db_instance" "wordpress_db" {
   password               = local.db_cred.password
 
   parameter_group_name   = "default.mysql8.0"
-  db_subnet_group_name   = aws_db_subnet_group.capstone_db_subnet_group.name
+  db_subnet_group_name   = aws_db_subnet_group.wordpress_db_subnet_group.name
   vpc_security_group_ids = [aws_security_group.capstone_sg_backend.id]
 
   publicly_accessible    = false
@@ -549,13 +564,13 @@ resource "aws_lb_listener" "wordpress_http_listener" {
 
 # Import the hosted zone 
 data "aws_route53_zone" "majiktech_zone" {
-  name         = "majiktech.uk"
+  name        = var.domain_name
   private_zone = false
 }
 
 # Create ACM certificate for ssl
 resource "aws_acm_certificate" "wordpress_acm" {
-  domain_name       = "majiktech.uk"
+ domain_name         = var.domain_name
   validation_method = "DNS"
 
   lifecycle {
@@ -593,7 +608,7 @@ resource "aws_lb_listener" "wordpress_https_listener" {
   port              = 443
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-2016-08"
-  certificate_arn   = aws_acm_certificate.wordpress_acm.arn
+  certificate_arn   = aws_acm_certificate_validation.wordpress_acm_validation.certificate_arn
 
   default_action {
     type             = "forward"
@@ -604,27 +619,28 @@ resource "aws_lb_listener" "wordpress_https_listener" {
 # Route53 validation records for ACM certificate
 resource "aws_route53_record" "wordpress_acm_validation" {
   for_each = {
-    for dvo in aws_acm_certificate.wordpress_acm_cert.domain_validation_options : dvo.domain_name => {
+    for dvo in aws_acm_certificate.wordpress_acm.domain_validation_options : dvo.domain_name => {
       name   = dvo.resource_record_name
       record = dvo.resource_record_value
       type   = dvo.resource_record_type
     }
   }
 
+  zone_id = data.aws_route53_zone.majiktech_zone.zone_id
   allow_overwrite = true
-  name            = each.value.name
-  records         = [each.value.record]
-  ttl             = 60
-  type            = each.value.type
-  zone_id         = data.aws_route53_zone.majiktech_uk.zone_id
+  name    = each.value.name
+  type    = each.value.type
+  ttl     = 60
+  records = [each.value.record]
 }
 
 # Validate ACM certificate using Route53 DNS records
 resource "aws_acm_certificate_validation" "wordpress_cert_validation" {
-  certificate_arn         = aws_acm_certificate.wordpress_acm_cert.arn
+  certificate_arn         = aws_acm_certificate.wordpress_acm.arn
   validation_record_fqdns = [for record in aws_route53_record.wordpress_acm_validation : record.fqdn]
 }
 
+# CloudWatch Alarm for High CPU Utilization
 resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   alarm_name          = "high-cpu-utilization"
   comparison_operator = "GreaterThanThreshold"
@@ -637,7 +653,7 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
 
   alarm_description   = "Triggers when CPU exceeds 70% utilization"
   dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.set27-auto-scaling-group.name
+    AutoScalingGroupName = aws_autoscaling_group.wordpress_asg.name
   }
 
   alarm_actions = [
@@ -645,3 +661,377 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
     aws_sns_topic.server_alert.arn
   ]
 }
+
+
+# create IAM Role
+resource "aws_iam_role" "iam_role" {
+  name = "${local.name}-iam-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = {
+    Name = "${local.name}-iam-role"
+  }
+}
+
+# Media S3 Bucket
+resource "aws_s3_bucket" "media_bucket" {
+  bucket        = "majik-tech-media-bucket"  # Unique global bucket name
+  force_destroy = true
+
+  tags = {
+    Name = "${local.name}-media-bucket"
+  }
+}
+
+
+# Public Access Configuration
+resource "aws_s3_bucket_public_access_block" "media_public_access" {
+  bucket                  = aws_s3_bucket.media_bucket.id
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
+# Bucket Ownership Controls
+resource "aws_s3_bucket_ownership_controls" "media_ownership" {
+  bucket = aws_s3_bucket.media_bucket.id
+
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+
+  depends_on = [
+    aws_s3_bucket_public_access_block.media_public_access
+  ]
+}
+
+# S3 Bucket Policy
+resource "aws_s3_bucket_policy" "media_bucket_policy" {
+  bucket = aws_s3_bucket.media_bucket.id
+  policy = data.aws_iam_policy_document.media_bucket_policy.json
+}
+
+data "aws_iam_policy_document" "media_bucket_policy" {
+  statement {
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:GetObjectVersion"
+    ]
+
+    resources = [
+      aws_s3_bucket.media_bucket.arn,
+      "${aws_s3_bucket.media_bucket.arn}/*"
+    ]
+  }
+}
+
+# S3 code bucket
+resource "aws_s3_bucket" "code_bucket" {
+  bucket        = "majik-tech-code-bucket"  # Unique global name
+  force_destroy = true
+
+  tags = {
+    Name = "${local.name}-code-bucket"
+  }
+}
+
+
+# IAM policy for media bucket access
+resource "aws_iam_policy" "media_iam_policy" {
+  name = "${local.name}-media-iam-policy"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:*"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# Attach IAM policy to role
+resource "aws_iam_role_policy_attachment" "media_iam_attachment" {
+  role       = aws_iam_role.iam_role.name
+  policy_arn = aws_iam_policy.media_iam_policy.arn
+}
+
+# IAM instance profile
+resource "aws_iam_instance_profile" "instance_profile" {
+  name = "${local.name}-instance-profile"
+  role = aws_iam_role.iam_role.name
+}
+
+# Log S3 Bucket
+resource "aws_s3_bucket" "log_bucket" {
+  bucket        = "majik-tech-log-bucket"  # Unique global name
+  force_destroy = true
+
+  tags = {
+    Name = "${local.name}-log-bucket"
+  }
+}
+
+
+# Log bucket ownership controls
+resource "aws_s3_bucket_ownership_controls" "log_bucket_ownership" {
+  bucket = aws_s3_bucket.log_bucket.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+# Log bucket ACL
+resource "aws_s3_bucket_acl" "log_bucket_acl" {
+  depends_on = [
+    aws_s3_bucket_ownership_controls.log_bucket_ownership
+  ]
+
+  bucket = aws_s3_bucket.log_bucket.id
+  acl    = "log-delivery-write"
+}
+
+# Log bucket policy document
+data "aws_iam_policy_document" "log_bucket_policy" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "s3:PutObject"
+    ]
+
+    resources = [
+      aws_s3_bucket.log_bucket.arn,
+      "${aws_s3_bucket.log_bucket.arn}/*"
+    ]
+  }
+}
+
+# Apply log bucket policy
+resource "aws_s3_bucket_policy" "log_bucket_policy" {
+  bucket = aws_s3_bucket.log_bucket.id
+  policy = data.aws_iam_policy_document.log_bucket_policy.json
+}
+
+# Log bucket public access settings
+resource "aws_s3_bucket_public_access_block" "log_bucket_public_access" {
+  bucket = aws_s3_bucket.log_bucket.id
+
+  block_public_acls       = false
+  ignore_public_acls      = false
+  block_public_policy     = false
+  restrict_public_buckets = false
+}
+
+# CloudWatch dashboard
+resource "aws_cloudwatch_dashboard" "infra_dashboard" {
+  dashboard_name = "${local.name}-infra-dashboard"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 6
+        height = 6
+
+        properties = {
+          metrics = [
+            [
+              "AWS/EC2",
+              "CPUUtilization",
+              "InstanceId",
+              aws_instance.wordpress_server.id,
+              { label = "Average CPU Utilization" }
+            ]
+          ]
+          period  = 300
+          region  = var.aws_region
+          stacked = false
+          stat    = "Average"
+          title   = "EC2 Average CPU Utilization"
+          view    = "timeSeries"
+
+          yAxis = {
+            left = {
+              label     = "Percentage"
+              showUnits = true
+            }
+          }
+        }
+      }
+    ]
+  })
+}
+
+# CloudWatch alarm for EC2 instance CPU
+resource "aws_cloudwatch_metric_alarm" "ec2_cpu_alarm" {
+  alarm_name          = "${local.name}-ec2-cpu-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120
+  statistic           = "Average"
+  threshold           = 50
+
+  alarm_description = "Triggers when EC2 CPU utilization exceeds 50%"
+  alarm_actions     = [aws_sns_topic.server_alert.arn]
+
+  dimensions = {
+    InstanceId = aws_instance.wordpress_server.id
+  }
+}
+
+# CloudWatch alarm for Auto Scaling Group CPU
+resource "aws_cloudwatch_metric_alarm" "asg_cpu_alarm" {
+  alarm_name          = "${local.name}-asg-cpu-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120
+  statistic           = "Average"
+  threshold           = 50
+
+  alarm_description = "Triggers when ASG CPU utilization exceeds 50%"
+  alarm_actions     = [
+    aws_autoscaling_policy.scale_out.arn,
+    aws_sns_topic.server_alert.arn
+  ]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.wordpress_asg.name
+  }
+}
+
+# SNS topic for alerts
+resource "aws_sns_topic" "server_alert" {
+  name = "${local.name}-server-alert"
+
+  delivery_policy = <<EOF
+{
+  "http": {
+    "defaultHealthyRetryPolicy": {
+      "minDelayTarget": 20,
+      "maxDelayTarget": 20,
+      "numRetries": 3,
+      "numMaxDelayRetries": 0,
+      "numNoDelayRetries": 0,
+      "numMinDelayRetries": 0,
+      "backoffFunction": "linear"
+    },
+    "disableSubscriptionOverrides": false,
+    "defaultThrottlePolicy": {
+      "maxReceivesPerSecond": 1
+    }
+  }
+}
+EOF
+}
+
+# SNS email subscription
+resource "aws_sns_topic_subscription" "alert_email_subscription" {
+  topic_arn = aws_sns_topic.server_alert.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# Route53 hosted zone
+data "aws_route53_zone" "primary_zone" {
+  name         = var.domain_name
+  private_zone = false
+}
+
+# Route53 ALB alias record
+resource "aws_route53_record" "alb_record" {
+  zone_id = data.aws_route53_zone.primary_zone.zone_id
+  name    = var.domain_name
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.wordpress_alb.dns_name
+    zone_id                = aws_lb.wordpress_alb.zone_id
+    evaluate_target_health = true
+  }
+}
+
+locals {
+  s3_origin_id = aws_s3_bucket.media_bucket.id
+}
+
+# CloudFront distribution for media bucket
+resource "aws_cloudfront_distribution" "media_distribution" {
+  origin {
+    domain_name = aws_s3_bucket.media_bucket.bucket_regional_domain_name
+    origin_id   = local.s3_origin_id
+  }
+
+  enabled = true
+
+  default_cache_behavior {
+    allowed_methods  = ["GET", "HEAD"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = local.s3_origin_id
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 3600
+    default_ttl            = 86400
+    max_ttl                = 31536000
+  }
+
+  price_class = "PriceClass_100"
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  tags = {
+    Name = "${local.name}-cloudfront"
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+}
+
+# CloudFront data reference
+data "aws_cloudfront_distribution" "cloudfront" {
+  id = aws_cloudfront_distribution.media_distribution.id
+}
+

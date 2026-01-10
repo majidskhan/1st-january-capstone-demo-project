@@ -57,7 +57,7 @@ aws s3 cp --recursive /var/www/html/ s3://code-bucket
 aws s3 sync /var/www/html/ s3://code-bucket
 
 echo "* * * * * ec2-user /usr/local/bin/aws s3 sync s3://code-bucket /var/www/html/" | sudo tee -a /etc/crontab
-echo "* * * * * ec2-user /usr/local/bin/aws s3 sync /var/www/html/wp-content/uploads/ s3://set25-media-bucket1" | sudo tee -a /etc/crontab
+echo "* * * * * ec2-user /usr/local/bin/aws s3 sync /var/www/html/wp-content/uploads/ s3://majik-tech-media-bucket" | sudo tee -a /etc/crontab
 
 sudo systemctl enable httpd
 sudo systemctl start httpd
